@@ -1,8 +1,9 @@
-name: Community Plugins — Build, Validate & Deploy
+name: Community Plugins — Build, Validate & Deploy (community-signed)
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -18,9 +19,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Build & Validate WASM ──────────────────────
+  resolve-channel:
+    name: Resolve Channel
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+    steps:
+      - id: channel
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=dev" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    name: Build Community WASM Plugins
+    name: Build Community WASM Plugins (${{ needs.resolve-channel.outputs.channel }})
+    needs: [resolve-channel]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,41 +65,41 @@ jobs:
             wasm_path="${plugin_dir}target/wasm32-wasip1/release/${wasm_name}.wasm"
 
             if [ -f "$wasm_path" ]; then
-              echo "Validating $wasm_path..."
               wasm-tools validate "$wasm_path" || true
-
               mkdir -p "artifacts/plugins/$plugin_name/$version"
               cp "$wasm_path" "artifacts/plugins/$plugin_name/$version/"
-
-              sha256sum "$wasm_path" >> artifacts/checksums.txt
+              b3sum "$wasm_path" >> artifacts/checksums.txt 2>/dev/null || sha256sum "$wasm_path" >> artifacts/checksums.txt
               echo "✓ $plugin_name v$version"
             fi
           done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: community-plugins
+          name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
           retention-days: 1
 
-  # ── Deploy to R2 ───────────────────────────────
   deploy:
-    name: Deploy to R2
-    needs: [build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Deploy to R2 (${{ needs.resolve-channel.outputs.channel }})
+    needs: [resolve-channel, build]
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: community-plugins
+          name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
 
-      - name: Prepare R2 directory
+      - name: Prepare R2 directory (per-channel community subtree)
+        env:
+          CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
         run: |
-          mkdir -p .r2_upload
-          cp -r artifacts/plugins/ .r2_upload/plugins/
+          mkdir -p ".r2_upload/${CHANNEL}/community"
+          cp -r artifacts/plugins/* ".r2_upload/${CHANNEL}/community/" 2>/dev/null || true
           find .r2_upload -type f | sort
 
       - name: Deploy to Cloudflare R2
@@ -99,27 +114,32 @@ jobs:
           AWS_S3_ENDPOINT: ${{ secrets.R2_API_URL }}
           SOURCE_DIR: ".r2_upload"
 
-  # ── Update Registry ────────────────────────────
   update-registry:
-    name: Update Registry
-    needs: [build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Update Registry (${{ needs.resolve-channel.outputs.channel }})
+    needs: [resolve-channel, build]
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: community-plugins
+          name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
 
-      - name: Update registry with artifacts and manifests
+      - name: Install b3sum
+        run: sudo apt-get update && sudo apt-get install -y b3sum || cargo install b3sum
+
+      # Community entries land under <channel>/community/manifest.json.
+      # Registry CI re-signs with the COMMUNITY key (not Official).
+      - name: Update per-channel community manifest
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_PAT }}
+          CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
         run: |
           set -e
-
           git clone https://x-access-token:${REGISTRY_PAT}@github.com/orvislab/rove-registry.git /tmp/registry
 
           COMMIT=$(git rev-parse --short HEAD)
@@ -127,7 +147,21 @@ jobs:
           R2_BASE="https://registry.roveai.co"
           GH_RAW="https://raw.githubusercontent.com/orvislab/rove-registry/main"
 
-          # ── Copy WASM artifacts + update community-manifest ──
+          MANIFEST="/tmp/registry/${CHANNEL}/community/manifest.json"
+          mkdir -p "$(dirname "$MANIFEST")"
+          if [ ! -f "$MANIFEST" ]; then
+            jq -n --arg ch "$CHANNEL" --arg ts "$TIMESTAMP" '{
+              schema_version: 2,
+              channel: $ch,
+              artifact: "community",
+              issuer: "rove-team-community",
+              trust_tier: 2,
+              published_at: $ts,
+              entries: {},
+              signature: ""
+            }' > "$MANIFEST"
+          fi
+
           for plugin_dir in artifacts/plugins/*/; do
             [ ! -d "$plugin_dir" ] && continue
             PLUGIN_NAME=$(basename "$plugin_dir")
@@ -138,60 +172,45 @@ jobs:
 
               for wasm in "$version_dir"*.wasm; do
                 [ ! -f "$wasm" ] && continue
-                HASH=$(sha256sum "$wasm" | cut -d' ' -f1)
+                HASH=$(b3sum "$wasm" | cut -d' ' -f1)
                 SIZE=$(stat --format=%s "$wasm" 2>/dev/null || stat -f%z "$wasm" 2>/dev/null)
                 WASM_FILE=$(basename "$wasm")
 
-                mkdir -p "/tmp/registry/releases/plugins/${PLUGIN_NAME}/${VERSION}"
-                cp "$wasm" "/tmp/registry/releases/plugins/${PLUGIN_NAME}/${VERSION}/${WASM_FILE}"
+                REL_DIR="${CHANNEL}/community/${PLUGIN_NAME}/${VERSION}"
+                mkdir -p "/tmp/registry/${REL_DIR}"
+                cp "$wasm" "/tmp/registry/${REL_DIR}/${WASM_FILE}"
 
-                cd /tmp/registry
                 jq --arg name "$PLUGIN_NAME" \
                    --arg ver "$VERSION" \
-                   --arg url "$R2_BASE/plugins/$PLUGIN_NAME/$VERSION/$WASM_FILE" \
-                   --arg fallback "$GH_RAW/releases/plugins/$PLUGIN_NAME/$VERSION/$WASM_FILE" \
-                   --arg sha "$HASH" \
+                   --arg url "$R2_BASE/$REL_DIR/$WASM_FILE" \
+                   --arg fallback "$GH_RAW/$REL_DIR/$WASM_FILE" \
+                   --arg b3 "$HASH" \
                    --argjson sz "${SIZE:-0}" \
-                   '.plugins[$name] = {"version": $ver, "author": "community", "trust_tier": 3, "url": $url, "fallback_url": $fallback, "sha256": $sha, "size_bytes": $sz}' \
-                   community-manifest.json > /tmp/m.json && mv /tmp/m.json community-manifest.json
-                cd -
+                   '.entries[$name] = {
+                     version: $ver,
+                     author: "community",
+                     trust_tier: 2,
+                     format: "wasm",
+                     url: $url,
+                     fallback_url: $fallback,
+                     blake3: $b3,
+                     size_bytes: $sz
+                   }' \
+                   "$MANIFEST" > /tmp/m.json && mv /tmp/m.json "$MANIFEST"
               done
             done
           done
 
-          # ── Build history ──
-          BUILDS_JSON="[]"
-          for plugin_dir in artifacts/plugins/*/; do
-            [ ! -d "$plugin_dir" ] && continue
-            PLUGIN_NAME=$(basename "$plugin_dir")
-            for version_dir in "$plugin_dir"*/; do
-              [ ! -d "$version_dir" ] && continue
-              VERSION=$(basename "$version_dir")
-              for wasm in "$version_dir"*.wasm; do
-                [ ! -f "$wasm" ] && continue
-                HASH=$(sha256sum "$wasm" | cut -d' ' -f1)
-                SIZE=$(stat --format=%s "$wasm" 2>/dev/null || stat -f%z "$wasm" 2>/dev/null)
-                BUILDS_JSON=$(echo "$BUILDS_JSON" | jq \
-                  --arg name "$PLUGIN_NAME" --arg ver "$VERSION" --arg commit "$COMMIT" \
-                  --arg ts "$TIMESTAMP" --arg sha "$HASH" --argjson sz "${SIZE:-0}" \
-                  '. += [{"plugin": $name, "version": $ver, "commit": $commit, "built_at": $ts, "sha256": $sha, "size_bytes": $sz}]')
-              done
-            done
-          done
+          jq --arg ts "$TIMESTAMP" '.published_at = $ts' "$MANIFEST" > /tmp/m.json && mv /tmp/m.json "$MANIFEST"
+          jq '.signature = ""' "$MANIFEST" > /tmp/m.json && mv /tmp/m.json "$MANIFEST"
 
-          jq --argjson new "$BUILDS_JSON" '.builds += $new' \
-            /tmp/registry/history/community-plugins.json > /tmp/c.json && mv /tmp/c.json /tmp/registry/history/community-plugins.json
-
-          # ── Commit + push ──
           cd /tmp/registry
-          jq --arg ts "$TIMESTAMP" '.last_updated = $ts' community-manifest.json > /tmp/m.json && mv /tmp/m.json community-manifest.json
-
           git config user.name "rove-ci"
           git config user.email "ci@roveai.co"
           git add -A
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No community manifest changes."
           else
-            git commit -m "release: community plugins (${COMMIT}) — $(date -u +%Y-%m-%d)"
+            git commit -m "release(${CHANNEL}): community plugins (${COMMIT})"
             git push
           fi
