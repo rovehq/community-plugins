@@ -34,7 +34,12 @@ from pathlib import Path
 
 
 def make_pem(hex_key: str, pem_path: str):
-    raw = bytes.fromhex(hex_key.strip())
+    cleaned = hex_key.strip()
+    try:
+        raw = bytes.fromhex(cleaned)
+    except ValueError as e:
+        print(f"ERROR: key is not valid hex (len={len(cleaned)}, first chars={repr(cleaned[:8])}): {e}", file=sys.stderr)
+        sys.exit(1)
     if len(raw) != 32:
         raise ValueError(f"Ed25519 seed must be 32 bytes, got {len(raw)}")
     prefix = bytes.fromhex("302e020100300506032b657004220420")
