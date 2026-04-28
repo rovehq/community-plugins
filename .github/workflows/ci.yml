@@ -56,78 +56,31 @@ jobs:
 
       - name: Build, sign & bundle each community plugin
         env:
-          # Community manifest JSON signing uses the official key (registry.json / index.json)
-          # Payload artifact signing also uses official key (verify_file_signature uses team_public_key)
-          # Community distinction is trust_tier=2 in manifest, signed by COMMUNITY key at manifest level
           OFFICIAL_PRIV: ${{ secrets.ROVE_TEAM_OFFICIAL_PRIVATE_KEY }}
           COMMUNITY_PRIV: ${{ secrets.ROVE_TEAM_COMMUNITY_PRIVATE_KEY }}
         run: |
           set -e
-          mkdir -p artifacts/plugins
+          mkdir -p artifacts/plugins artifacts/registry
 
-          echo "$OFFICIAL_PRIV" > /tmp/official_priv.hex
+          echo "$OFFICIAL_PRIV"  > /tmp/official_priv.hex
           echo "$COMMUNITY_PRIV" > /tmp/community_priv.hex
 
-          # Build PEM from hex-encoded 32-byte Ed25519 seed
           make_pem() {
-            local hex_file="$1"
-            python3 -c "
+            python3 - "$1" << 'PYPEM'
 import sys, binascii, base64
-raw = open('$hex_file').read().strip()
+raw = open(sys.argv[1]).read().strip()
 b = binascii.unhexlify(raw)
 prefix = bytes.fromhex('302e020100300506032b657004220420')
 der = prefix + b
 pem = '-----BEGIN PRIVATE KEY-----\n' + base64.encodebytes(der).decode() + '-----END PRIVATE KEY-----\n'
-sys.stdout.write(pem)
-"
+open(sys.argv[1].replace('.hex', '.pem'), 'w').write(pem)
+PYPEM
           }
 
-          sign_payload() {
-            local wasm_file="$1"
-            # payload_signature always verified with team_public_key (Official) — see crypto/mod.rs:331
-            local hash
-            hash=$(sha256sum "$wasm_file" | cut -d' ' -f1)
-            echo -n "$hash" > /tmp/hash_str.bin
-            openssl pkeyutl -sign -rawin \
-              -inkey <(make_pem /tmp/official_priv.hex) \
-              -in /tmp/hash_str.bin \
-              -out /tmp/payload_sig.bin 2>/dev/null
-            xxd -p /tmp/payload_sig.bin | tr -d '\n'
-            rm -f /tmp/hash_str.bin /tmp/payload_sig.bin
-          }
-
-          sign_registry_json_with() {
-            # Community manifest JSONs (index.json, release.json) signed with community key
-            local json_file="$1"
-            local key_hex_file="$2"
-            local signed_at
-            signed_at=$(date +%s)
-            CANON=$(python3 -c "
-import json, sys
-d = json.load(open('$json_file'))
-d.pop('signature', None)
-d.pop('signed_at', None)
-sys.stdout.write(json.dumps(d, sort_keys=True, separators=(',',':')))
-")
-            echo -n "$CANON" > /tmp/canon.bin
-            openssl pkeyutl -sign -rawin \
-              -inkey <(make_pem "$key_hex_file") \
-              -in /tmp/canon.bin \
-              -out /tmp/reg_sig.bin 2>/dev/null
-            SIG=$(xxd -p /tmp/reg_sig.bin | tr -d '\n')
-            rm -f /tmp/canon.bin /tmp/reg_sig.bin
-            python3 -c "
-import json
-d = json.load(open('$json_file'))
-d['signed_at'] = $signed_at
-d['signature'] = '$SIG'
-open('$json_file','w').write(json.dumps(d, indent=2))
-"
-          }
+          make_pem /tmp/official_priv.hex
+          make_pem /tmp/community_priv.hex
 
           TIMESTAMP=$(date +%s)
-          REGISTRY_DIR="artifacts/registry"
-          mkdir -p "$REGISTRY_DIR"
 
           for plugin_dir in */; do
             [ ! -f "${plugin_dir}Cargo.toml" ] && continue
@@ -141,14 +94,22 @@ open('$json_file','w').write(json.dumps(d, indent=2))
             wasm_name=$(echo "$plugin_name" | tr '-' '_')
             wasm_src="${plugin_dir}target/wasm32-wasip1/release/${wasm_name}.wasm"
 
-            [ ! -f "$wasm_src" ] && echo "  WARN: no wasm at $wasm_src, skipping" && continue
+            if [ ! -f "$wasm_src" ]; then
+              echo "  WARN: no wasm at $wasm_src, skipping"
+              continue
+            fi
 
             wasm-tools validate "$wasm_src" || true
 
+            # payload_signature: always Official key (crypto/mod.rs:331 uses team_public_key)
             payload_hash=$(sha256sum "$wasm_src" | cut -d' ' -f1)
-            payload_sig=$(sign_payload "$wasm_src")
+            echo -n "$payload_hash" > /tmp/hash_str.bin
+            openssl pkeyutl -sign -rawin -inkey /tmp/official_priv.pem -in /tmp/hash_str.bin -out /tmp/payload_sig.bin
+            payload_sig=$(xxd -p /tmp/payload_sig.bin | tr -d '\n')
+            rm -f /tmp/hash_str.bin /tmp/payload_sig.bin
 
-            bundle_dir="artifacts/plugins/${plugin_name}/${version}"
+            plugin_id=$(echo "$plugin_name" | tr '_' '-')
+            bundle_dir="artifacts/registry/${plugin_id}/${version}"
             mkdir -p "$bundle_dir"
 
             cp "$wasm_src" "$bundle_dir/${wasm_name}.wasm"
@@ -166,150 +127,145 @@ open('$json_file','w').write(json.dumps(d, indent=2))
               readme_rel="README.md"
             fi
 
-            plugin_id=$(echo "$plugin_name" | tr '_' '-')
-            cat > "$bundle_dir/plugin-package.json" <<PKGJSON
-{
-  "id": "${plugin_id}",
-  "artifact": "${wasm_name}.wasm",
-  "runtime_config": "${runtime_rel}",
-  "payload_hash": "${payload_hash}",
-  "payload_signature": "${payload_sig}",
-  "enabled": true
-}
-PKGJSON
-
             trust_tier=$(python3 -c "import json; print(json.load(open('${plugin_dir}manifest.json')).get('trust_tier','Community'))")
-            cat > "$bundle_dir/release.json" <<RELJSON
-{
-  "id": "${plugin_id}",
-  "name": "${plugin_name}",
-  "version": "${version}",
-  "plugin_type": "Skill",
-  "trust_tier": "${trust_tier}",
-  "generated_at": ${TIMESTAMP},
-  "signed_at": 0,
-  "signature": "",
-  "artifact": "${wasm_name}.wasm",
-  "runtime_config": "${runtime_rel}"
+
+            python3 - "$bundle_dir" "$plugin_id" "$wasm_name" "$payload_hash" "$payload_sig" "$runtime_rel" "$version" "$trust_tier" << 'PYEOF'
+import json, sys
+bundle_dir, plugin_id, wasm_name, payload_hash, payload_sig, runtime_rel, version, trust_tier = sys.argv[1:]
+pkg = {
+    "id": plugin_id,
+    "artifact": f"{wasm_name}.wasm",
+    "runtime_config": runtime_rel,
+    "payload_hash": payload_hash,
+    "payload_signature": payload_sig,
+    "enabled": True
 }
-RELJSON
-            # Community release.json / index.json signed with community key
-            sign_registry_json_with "$bundle_dir/release.json" /tmp/community_priv.hex
+open(f"{bundle_dir}/plugin-package.json", "w").write(json.dumps(pkg, indent=2))
+PYEOF
 
-            plugin_id_safe="$plugin_id"
-            mkdir -p "$REGISTRY_DIR/${plugin_id_safe}"
-            index_file="$REGISTRY_DIR/${plugin_id_safe}/index.json"
-            bundle_rel="${plugin_id_safe}/${version}"
+            python3 - "$bundle_dir" "$plugin_id" "$plugin_name" "$version" "$trust_tier" "$wasm_name" "$runtime_rel" "$TIMESTAMP" << 'PYEOF'
+import json, sys
+bundle_dir, plugin_id, plugin_name, version, trust_tier, wasm_name, runtime_rel, ts = sys.argv[1:]
+rel = {
+    "id": plugin_id,
+    "name": plugin_name,
+    "version": version,
+    "plugin_type": "Skill",
+    "trust_tier": trust_tier,
+    "generated_at": int(ts),
+    "signed_at": 0,
+    "signature": "",
+    "artifact": f"{wasm_name}.wasm",
+    "runtime_config": runtime_rel
+}
+open(f"{bundle_dir}/release.json", "w").write(json.dumps(rel, indent=2))
+PYEOF
 
-            artifact_path_entry="${bundle_rel}/${wasm_name}.wasm"
-            runtime_path_entry=""
-            [ -n "$runtime_rel" ] && runtime_path_entry="${bundle_rel}/runtime.json"
-            readme_path_entry=""
-            [ -n "$readme_rel" ] && readme_path_entry="${bundle_rel}/README.md"
+            python3 - "$bundle_dir/release.json" /tmp/community_priv.pem << 'PYEOF'
+import json, sys, subprocess, time
+json_file, pem_file = sys.argv[1:]
+d = json.load(open(json_file))
+d.pop("signature", None); d.pop("signed_at", None)
+canon = json.dumps(d, sort_keys=True, separators=(",",":"))
+open("/tmp/sign_canon.bin","wb").write(canon.encode())
+subprocess.run(["openssl","pkeyutl","-sign","-rawin","-inkey",pem_file,
+                "-in","/tmp/sign_canon.bin","-out","/tmp/sign_out.bin"], check=True)
+sig = open("/tmp/sign_out.bin","rb").read().hex()
+d["signed_at"] = int(time.time()); d["signature"] = sig
+open(json_file,"w").write(json.dumps(d, indent=2))
+PYEOF
 
-            python3 - <<PYEOF
-import json
-
-index_file = "$index_file"
-plugin_id = "$plugin_id_safe"
-plugin_name = "$plugin_name"
-version = "$version"
-trust_tier = "$trust_tier"
-bundle_rel = "$bundle_rel"
-timestamp = $TIMESTAMP
-artifact_path_entry = "$artifact_path_entry"
-runtime_path_entry = "$runtime_path_entry"
-readme_path_entry = "$readme_path_entry"
+            python3 - "artifacts/registry" "$plugin_id" "$plugin_name" "$version" "$trust_tier" "$wasm_name" "$runtime_rel" "$readme_rel" "$TIMESTAMP" << 'PYEOF'
+import json, sys
+registry_dir, plugin_id, plugin_name, version, trust_tier, wasm_name, runtime_rel, readme_rel, ts = sys.argv[1:]
+ts = int(ts)
+index_file = f"{registry_dir}/{plugin_id}/index.json"
+bundle_rel = f"{plugin_id}/{version}"
 
 try:
     idx = json.load(open(index_file))
-except:
+except Exception:
     idx = {
-        "schema_version": "1",
-        "generated_at": timestamp,
-        "signed_at": 0,
-        "signature": "",
-        "plugin": {
-            "id": plugin_id,
-            "name": plugin_name,
-            "plugin_type": "Skill",
-            "trust_tier": trust_tier,
-            "latest_version": version,
-            "index_path": f"{plugin_id}/index.json"
-        },
+        "schema_version": "1", "generated_at": ts, "signed_at": 0, "signature": "",
+        "plugin": {"id": plugin_id, "name": plugin_name, "plugin_type": "Skill",
+                   "trust_tier": trust_tier, "latest_version": version,
+                   "index_path": f"{plugin_id}/index.json"},
         "versions": []
     }
 
-idx["generated_at"] = timestamp
+idx["generated_at"] = ts
 idx["plugin"]["latest_version"] = version
-idx["plugin"]["trust_tier"] = trust_tier
 idx["versions"] = [v for v in idx["versions"] if v["version"] != version]
 idx["versions"].insert(0, {
-    "version": version,
-    "published_at": timestamp,
-    "bundle_path": bundle_rel,
+    "version": version, "published_at": ts, "bundle_path": bundle_rel,
     "manifest_path": f"{bundle_rel}/manifest.json",
     "package_path": f"{bundle_rel}/plugin-package.json",
-    "runtime_path": runtime_path_entry if runtime_path_entry else None,
-    "artifact_path": artifact_path_entry if artifact_path_entry else None,
+    "runtime_path": f"{bundle_rel}/runtime.json" if runtime_rel else None,
+    "artifact_path": f"{bundle_rel}/{wasm_name}.wasm",
     "artifact_sidecar_path": None,
-    "readme_path": readme_path_entry if readme_path_entry else None,
+    "readme_path": f"{bundle_rel}/README.md" if readme_rel else None,
     "release_path": f"{bundle_rel}/release.json"
 })
-
 try:
     from packaging.version import Version as V
     idx["versions"].sort(key=lambda x: V(x["version"]), reverse=True)
-except:
+except Exception:
     idx["versions"].sort(key=lambda x: x["version"], reverse=True)
 
 open(index_file, "w").write(json.dumps(idx, indent=2))
 PYEOF
 
-            sign_registry_json_with "$index_file" /tmp/community_priv.hex
+            python3 - "$bundle_dir/../index.json" /tmp/community_priv.pem << 'PYEOF'
+import json, sys, subprocess, time
+json_file, pem_file = sys.argv[1:]
+d = json.load(open(json_file))
+d.pop("signature", None); d.pop("signed_at", None)
+canon = json.dumps(d, sort_keys=True, separators=(",",":"))
+open("/tmp/sign_canon.bin","wb").write(canon.encode())
+subprocess.run(["openssl","pkeyutl","-sign","-rawin","-inkey",pem_file,
+                "-in","/tmp/sign_canon.bin","-out","/tmp/sign_out.bin"], check=True)
+sig = open("/tmp/sign_out.bin","rb").read().hex()
+d["signed_at"] = int(time.time()); d["signature"] = sig
+open(json_file,"w").write(json.dumps(d, indent=2))
+PYEOF
 
-            mkdir -p "$REGISTRY_DIR/${plugin_id_safe}/${version}"
-            cp -r "$bundle_dir/." "$REGISTRY_DIR/${plugin_id_safe}/${version}/"
-
-            echo "  ✓ $plugin_name v$version"
+            echo "  done: $plugin_id v$version"
           done
 
-          # Generate top-level community registry.json (signed with community key)
-          python3 - <<PYEOF2
-import json, glob
-
-registry_dir = "artifacts/registry"
-timestamp = $TIMESTAMP
-
+          python3 - "artifacts/registry" "$TIMESTAMP" /tmp/community_priv.pem << 'PYEOF'
+import json, sys, subprocess, glob, time
+registry_dir, ts, pem_file = sys.argv[1:]
+ts = int(ts)
 catalog_file = f"{registry_dir}/registry.json"
 try:
     catalog = json.load(open(catalog_file))
-except:
-    catalog = {
-        "schema_version": "1",
-        "generated_at": timestamp,
-        "signed_at": 0,
-        "signature": "",
-        "plugins": []
-    }
-
-catalog["generated_at"] = timestamp
+except Exception:
+    catalog = {"schema_version":"1","generated_at":ts,"signed_at":0,"signature":"","plugins":[]}
+catalog["generated_at"] = ts
 plugins = []
-for index_file in glob.glob(f"{registry_dir}/*/index.json"):
+for f in glob.glob(f"{registry_dir}/*/index.json"):
     try:
-        idx = json.load(open(index_file))
-        plugins.append(idx["plugin"])
-    except:
-        pass
+        idx = json.load(open(f)); plugins.append(idx["plugin"])
+    except Exception: pass
 plugins.sort(key=lambda x: x.get("name",""))
 catalog["plugins"] = plugins
-open(catalog_file, "w").write(json.dumps(catalog, indent=2))
-PYEOF2
+open(catalog_file,"w").write(json.dumps(catalog, indent=2))
 
-          sign_registry_json_with "artifacts/registry/registry.json" /tmp/community_priv.hex
+d = json.load(open(catalog_file))
+d.pop("signature",None); d.pop("signed_at",None)
+canon = json.dumps(d, sort_keys=True, separators=(",",":"))
+open("/tmp/sign_canon.bin","wb").write(canon.encode())
+subprocess.run(["openssl","pkeyutl","-sign","-rawin","-inkey",pem_file,
+                "-in","/tmp/sign_canon.bin","-out","/tmp/sign_out.bin"], check=True)
+sig = open("/tmp/sign_out.bin","rb").read().hex()
+d["signed_at"] = int(time.time()); d["signature"] = sig
+open(catalog_file,"w").write(json.dumps(d, indent=2))
+PYEOF
 
-          shred -u /tmp/official_priv.hex /tmp/community_priv.hex 2>/dev/null || \
-            rm -f /tmp/official_priv.hex /tmp/community_priv.hex
+          shred -u /tmp/official_priv.hex /tmp/official_priv.pem \
+                   /tmp/community_priv.hex /tmp/community_priv.pem 2>/dev/null || \
+            rm -f /tmp/official_priv.hex /tmp/official_priv.pem \
+                  /tmp/community_priv.hex /tmp/community_priv.pem
 
           echo "=== Bundle summary ==="
           find artifacts/ -type f | sort
@@ -381,18 +337,15 @@ PYEOF2
         run: |
           set -e
           git clone https://x-access-token:${REGISTRY_PAT}@github.com/rovehq/registry.git /tmp/registry
-
           COMMIT=$(git rev-parse --short HEAD)
-
           mkdir -p "/tmp/registry/${CHANNEL}/community"
           cp -r artifacts/registry/. "/tmp/registry/${CHANNEL}/community/"
-
           cd /tmp/registry
           git config user.name "rove-ci"
           git config user.email "ci@roveai.co"
           git add -A
           if git diff --cached --quiet; then
-            echo "No changes to registry."
+            echo "No changes."
           else
             git commit -m "release(${CHANNEL}): community plugins (${COMMIT})"
             git push
