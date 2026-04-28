@@ -106,6 +106,12 @@ def sign_payload(wasm_path: str, pem_path: str) -> str:
     return Path(sig_file).read_bytes().hex()
 
 
+def normalize_trust_tier(value) -> str:
+    if isinstance(value, int):
+        return {0: "Official", 1: "Official", 2: "Community"}.get(value, "Official")
+    return str(value)
+
+
 def bundle_plugin(plugin_dir: str, wasm_file: str, registry_dir: str, pem_path: str, json_sign_pem: str = None):
     plugin_path = Path(plugin_dir)
     manifest_file = plugin_path / "manifest.json"
@@ -118,7 +124,7 @@ def bundle_plugin(plugin_dir: str, wasm_file: str, registry_dir: str, pem_path: 
     plugin_name = plugin_path.name
     plugin_id = plugin_name.replace("_", "-")
     wasm_name = plugin_name.replace("-", "_")
-    trust_tier = manifest.get("trust_tier", "Official")
+    trust_tier = normalize_trust_tier(manifest.get("trust_tier", "Official"))
 
     wasm_path = Path(wasm_file)
     if not wasm_path.exists():
