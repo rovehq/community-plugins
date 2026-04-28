@@ -1,4 +1,4 @@
-name: Community Plugins — Build, Validate & Deploy (community-signed)
+name: Community Plugins — Build, Sign & Deploy (community-signed)
 
 on:
   push:
@@ -15,7 +15,6 @@ on:
       - "**/Cargo.toml"
       - "Cargo.lock"
   schedule:
-    # Nightly dev pre-build at 22:00 UTC — aligns with core/ + plugins/.
     - cron: "0 22 * * *"
   workflow_dispatch: {}
 
@@ -38,7 +37,7 @@ jobs:
           fi
 
   build:
-    name: Build Community WASM Plugins (${{ needs.resolve-channel.outputs.channel }})
+    name: Build & Sign Community WASM Plugins (${{ needs.resolve-channel.outputs.channel }})
     needs: [resolve-channel]
     runs-on: ubuntu-latest
     steps:
@@ -50,32 +49,270 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install wasmtools
-        run: cargo install wasm-tools || true
-
-      - name: Build and validate each plugin
+      - name: Install tools
         run: |
+          cargo install wasm-tools 2>/dev/null || true
+          sudo apt-get update -qq && sudo apt-get install -y -qq openssl xxd 2>/dev/null || true
+
+      - name: Build, sign & bundle each community plugin
+        env:
+          # Community manifest JSON signing uses the official key (registry.json / index.json)
+          # Payload artifact signing also uses official key (verify_file_signature uses team_public_key)
+          # Community distinction is trust_tier=2 in manifest, signed by COMMUNITY key at manifest level
+          OFFICIAL_PRIV: ${{ secrets.ROVE_TEAM_OFFICIAL_PRIVATE_KEY }}
+          COMMUNITY_PRIV: ${{ secrets.ROVE_TEAM_COMMUNITY_PRIVATE_KEY }}
+        run: |
+          set -e
           mkdir -p artifacts/plugins
 
+          echo "$OFFICIAL_PRIV" > /tmp/official_priv.hex
+          echo "$COMMUNITY_PRIV" > /tmp/community_priv.hex
+
+          # Build PEM from hex-encoded 32-byte Ed25519 seed
+          make_pem() {
+            local hex_file="$1"
+            python3 -c "
+import sys, binascii, base64
+raw = open('$hex_file').read().strip()
+b = binascii.unhexlify(raw)
+prefix = bytes.fromhex('302e020100300506032b657004220420')
+der = prefix + b
+pem = '-----BEGIN PRIVATE KEY-----\n' + base64.encodebytes(der).decode() + '-----END PRIVATE KEY-----\n'
+sys.stdout.write(pem)
+"
+          }
+
+          sign_payload() {
+            local wasm_file="$1"
+            # payload_signature always verified with team_public_key (Official) — see crypto/mod.rs:331
+            local hash
+            hash=$(sha256sum "$wasm_file" | cut -d' ' -f1)
+            echo -n "$hash" > /tmp/hash_str.bin
+            openssl pkeyutl -sign -rawin \
+              -inkey <(make_pem /tmp/official_priv.hex) \
+              -in /tmp/hash_str.bin \
+              -out /tmp/payload_sig.bin 2>/dev/null
+            xxd -p /tmp/payload_sig.bin | tr -d '\n'
+            rm -f /tmp/hash_str.bin /tmp/payload_sig.bin
+          }
+
+          sign_registry_json_with() {
+            # Community manifest JSONs (index.json, release.json) signed with community key
+            local json_file="$1"
+            local key_hex_file="$2"
+            local signed_at
+            signed_at=$(date +%s)
+            CANON=$(python3 -c "
+import json, sys
+d = json.load(open('$json_file'))
+d.pop('signature', None)
+d.pop('signed_at', None)
+sys.stdout.write(json.dumps(d, sort_keys=True, separators=(',',':')))
+")
+            echo -n "$CANON" > /tmp/canon.bin
+            openssl pkeyutl -sign -rawin \
+              -inkey <(make_pem "$key_hex_file") \
+              -in /tmp/canon.bin \
+              -out /tmp/reg_sig.bin 2>/dev/null
+            SIG=$(xxd -p /tmp/reg_sig.bin | tr -d '\n')
+            rm -f /tmp/canon.bin /tmp/reg_sig.bin
+            python3 -c "
+import json
+d = json.load(open('$json_file'))
+d['signed_at'] = $signed_at
+d['signature'] = '$SIG'
+open('$json_file','w').write(json.dumps(d, indent=2))
+"
+          }
+
+          TIMESTAMP=$(date +%s)
+          REGISTRY_DIR="artifacts/registry"
+          mkdir -p "$REGISTRY_DIR"
+
           for plugin_dir in */; do
-            [ ! -f "$plugin_dir/Cargo.toml" ] && continue
-            plugin_name=$(basename "$plugin_dir")
+            [ ! -f "${plugin_dir}Cargo.toml" ] && continue
+            [ ! -f "${plugin_dir}manifest.json" ] && continue
+            plugin_name=$(basename "$plugin_dir" | tr -d '/')
 
             echo "=== Building: $plugin_name ==="
             (cd "$plugin_dir" && cargo build --target wasm32-wasip1 --release)
 
-            version=$(grep '^version' "$plugin_dir/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            version=$(python3 -c "import json; print(json.load(open('${plugin_dir}manifest.json'))['version'])")
             wasm_name=$(echo "$plugin_name" | tr '-' '_')
-            wasm_path="${plugin_dir}target/wasm32-wasip1/release/${wasm_name}.wasm"
+            wasm_src="${plugin_dir}target/wasm32-wasip1/release/${wasm_name}.wasm"
 
-            if [ -f "$wasm_path" ]; then
-              wasm-tools validate "$wasm_path" || true
-              mkdir -p "artifacts/plugins/$plugin_name/$version"
-              cp "$wasm_path" "artifacts/plugins/$plugin_name/$version/"
-              b3sum "$wasm_path" >> artifacts/checksums.txt 2>/dev/null || sha256sum "$wasm_path" >> artifacts/checksums.txt
-              echo "✓ $plugin_name v$version"
+            [ ! -f "$wasm_src" ] && echo "  WARN: no wasm at $wasm_src, skipping" && continue
+
+            wasm-tools validate "$wasm_src" || true
+
+            payload_hash=$(sha256sum "$wasm_src" | cut -d' ' -f1)
+            payload_sig=$(sign_payload "$wasm_src")
+
+            bundle_dir="artifacts/plugins/${plugin_name}/${version}"
+            mkdir -p "$bundle_dir"
+
+            cp "$wasm_src" "$bundle_dir/${wasm_name}.wasm"
+            cp "${plugin_dir}manifest.json" "$bundle_dir/manifest.json"
+
+            runtime_rel=""
+            if [ -f "${plugin_dir}runtime.json" ]; then
+              cp "${plugin_dir}runtime.json" "$bundle_dir/runtime.json"
+              runtime_rel="runtime.json"
             fi
+
+            readme_rel=""
+            if [ -f "${plugin_dir}README.md" ]; then
+              cp "${plugin_dir}README.md" "$bundle_dir/README.md"
+              readme_rel="README.md"
+            fi
+
+            plugin_id=$(echo "$plugin_name" | tr '_' '-')
+            cat > "$bundle_dir/plugin-package.json" <<PKGJSON
+{
+  "id": "${plugin_id}",
+  "artifact": "${wasm_name}.wasm",
+  "runtime_config": "${runtime_rel}",
+  "payload_hash": "${payload_hash}",
+  "payload_signature": "${payload_sig}",
+  "enabled": true
+}
+PKGJSON
+
+            trust_tier=$(python3 -c "import json; print(json.load(open('${plugin_dir}manifest.json')).get('trust_tier','Community'))")
+            cat > "$bundle_dir/release.json" <<RELJSON
+{
+  "id": "${plugin_id}",
+  "name": "${plugin_name}",
+  "version": "${version}",
+  "plugin_type": "Skill",
+  "trust_tier": "${trust_tier}",
+  "generated_at": ${TIMESTAMP},
+  "signed_at": 0,
+  "signature": "",
+  "artifact": "${wasm_name}.wasm",
+  "runtime_config": "${runtime_rel}"
+}
+RELJSON
+            # Community release.json / index.json signed with community key
+            sign_registry_json_with "$bundle_dir/release.json" /tmp/community_priv.hex
+
+            plugin_id_safe="$plugin_id"
+            mkdir -p "$REGISTRY_DIR/${plugin_id_safe}"
+            index_file="$REGISTRY_DIR/${plugin_id_safe}/index.json"
+            bundle_rel="${plugin_id_safe}/${version}"
+
+            artifact_path_entry="${bundle_rel}/${wasm_name}.wasm"
+            runtime_path_entry=""
+            [ -n "$runtime_rel" ] && runtime_path_entry="${bundle_rel}/runtime.json"
+            readme_path_entry=""
+            [ -n "$readme_rel" ] && readme_path_entry="${bundle_rel}/README.md"
+
+            python3 - <<PYEOF
+import json
+
+index_file = "$index_file"
+plugin_id = "$plugin_id_safe"
+plugin_name = "$plugin_name"
+version = "$version"
+trust_tier = "$trust_tier"
+bundle_rel = "$bundle_rel"
+timestamp = $TIMESTAMP
+artifact_path_entry = "$artifact_path_entry"
+runtime_path_entry = "$runtime_path_entry"
+readme_path_entry = "$readme_path_entry"
+
+try:
+    idx = json.load(open(index_file))
+except:
+    idx = {
+        "schema_version": "1",
+        "generated_at": timestamp,
+        "signed_at": 0,
+        "signature": "",
+        "plugin": {
+            "id": plugin_id,
+            "name": plugin_name,
+            "plugin_type": "Skill",
+            "trust_tier": trust_tier,
+            "latest_version": version,
+            "index_path": f"{plugin_id}/index.json"
+        },
+        "versions": []
+    }
+
+idx["generated_at"] = timestamp
+idx["plugin"]["latest_version"] = version
+idx["plugin"]["trust_tier"] = trust_tier
+idx["versions"] = [v for v in idx["versions"] if v["version"] != version]
+idx["versions"].insert(0, {
+    "version": version,
+    "published_at": timestamp,
+    "bundle_path": bundle_rel,
+    "manifest_path": f"{bundle_rel}/manifest.json",
+    "package_path": f"{bundle_rel}/plugin-package.json",
+    "runtime_path": runtime_path_entry if runtime_path_entry else None,
+    "artifact_path": artifact_path_entry if artifact_path_entry else None,
+    "artifact_sidecar_path": None,
+    "readme_path": readme_path_entry if readme_path_entry else None,
+    "release_path": f"{bundle_rel}/release.json"
+})
+
+try:
+    from packaging.version import Version as V
+    idx["versions"].sort(key=lambda x: V(x["version"]), reverse=True)
+except:
+    idx["versions"].sort(key=lambda x: x["version"], reverse=True)
+
+open(index_file, "w").write(json.dumps(idx, indent=2))
+PYEOF
+
+            sign_registry_json_with "$index_file" /tmp/community_priv.hex
+
+            mkdir -p "$REGISTRY_DIR/${plugin_id_safe}/${version}"
+            cp -r "$bundle_dir/." "$REGISTRY_DIR/${plugin_id_safe}/${version}/"
+
+            echo "  ✓ $plugin_name v$version"
           done
+
+          # Generate top-level community registry.json (signed with community key)
+          python3 - <<PYEOF2
+import json, glob
+
+registry_dir = "artifacts/registry"
+timestamp = $TIMESTAMP
+
+catalog_file = f"{registry_dir}/registry.json"
+try:
+    catalog = json.load(open(catalog_file))
+except:
+    catalog = {
+        "schema_version": "1",
+        "generated_at": timestamp,
+        "signed_at": 0,
+        "signature": "",
+        "plugins": []
+    }
+
+catalog["generated_at"] = timestamp
+plugins = []
+for index_file in glob.glob(f"{registry_dir}/*/index.json"):
+    try:
+        idx = json.load(open(index_file))
+        plugins.append(idx["plugin"])
+    except:
+        pass
+plugins.sort(key=lambda x: x.get("name",""))
+catalog["plugins"] = plugins
+open(catalog_file, "w").write(json.dumps(catalog, indent=2))
+PYEOF2
+
+          sign_registry_json_with "artifacts/registry/registry.json" /tmp/community_priv.hex
+
+          shred -u /tmp/official_priv.hex /tmp/community_priv.hex 2>/dev/null || \
+            rm -f /tmp/official_priv.hex /tmp/community_priv.hex
+
+          echo "=== Bundle summary ==="
+          find artifacts/ -type f | sort
 
       - uses: actions/upload-artifact@v4
         with:
@@ -100,12 +337,12 @@ jobs:
           name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
 
-      - name: Prepare R2 directory (per-channel community subtree)
+      - name: Prepare R2 layout
         env:
           CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
         run: |
           mkdir -p ".r2_upload/${CHANNEL}/community"
-          cp -r artifacts/plugins/* ".r2_upload/${CHANNEL}/community/" 2>/dev/null || true
+          cp -r artifacts/registry/. ".r2_upload/${CHANNEL}/community/" 2>/dev/null || true
           find .r2_upload -type f | sort
 
       - name: Deploy to Cloudflare R2
@@ -121,7 +358,7 @@ jobs:
           SOURCE_DIR: ".r2_upload"
 
   update-registry:
-    name: Update Registry (${{ needs.resolve-channel.outputs.channel }})
+    name: Update Registry Repo (${{ needs.resolve-channel.outputs.channel }})
     needs: [resolve-channel, build]
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
@@ -137,12 +374,7 @@ jobs:
           name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
 
-      - name: Install b3sum
-        run: sudo apt-get update && sudo apt-get install -y b3sum || cargo install b3sum
-
-      # Community entries land under <channel>/community/manifest.json.
-      # Registry CI re-signs with the COMMUNITY key (not Official).
-      - name: Update per-channel community manifest
+      - name: Push to registry repo
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_PAT }}
           CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
@@ -151,73 +383,16 @@ jobs:
           git clone https://x-access-token:${REGISTRY_PAT}@github.com/rovehq/registry.git /tmp/registry
 
           COMMIT=$(git rev-parse --short HEAD)
-          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          R2_BASE="https://registry.roveai.co"
-          GH_RAW="https://raw.githubusercontent.com/rovehq/registry/main"
 
-          MANIFEST="/tmp/registry/${CHANNEL}/community/manifest.json"
-          mkdir -p "$(dirname "$MANIFEST")"
-          if [ ! -f "$MANIFEST" ]; then
-            jq -n --arg ch "$CHANNEL" --arg ts "$TIMESTAMP" '{
-              schema_version: 2,
-              channel: $ch,
-              artifact: "community",
-              issuer: "rove-team-community",
-              trust_tier: 2,
-              published_at: $ts,
-              entries: {},
-              signature: ""
-            }' > "$MANIFEST"
-          fi
-
-          for plugin_dir in artifacts/plugins/*/; do
-            [ ! -d "$plugin_dir" ] && continue
-            PLUGIN_NAME=$(basename "$plugin_dir")
-
-            for version_dir in "$plugin_dir"*/; do
-              [ ! -d "$version_dir" ] && continue
-              VERSION=$(basename "$version_dir")
-
-              for wasm in "$version_dir"*.wasm; do
-                [ ! -f "$wasm" ] && continue
-                HASH=$(b3sum "$wasm" | cut -d' ' -f1)
-                SIZE=$(stat --format=%s "$wasm" 2>/dev/null || stat -f%z "$wasm" 2>/dev/null)
-                WASM_FILE=$(basename "$wasm")
-
-                REL_DIR="${CHANNEL}/community/${PLUGIN_NAME}/${VERSION}"
-                mkdir -p "/tmp/registry/${REL_DIR}"
-                cp "$wasm" "/tmp/registry/${REL_DIR}/${WASM_FILE}"
-
-                jq --arg name "$PLUGIN_NAME" \
-                   --arg ver "$VERSION" \
-                   --arg url "$R2_BASE/$REL_DIR/$WASM_FILE" \
-                   --arg fallback "$GH_RAW/$REL_DIR/$WASM_FILE" \
-                   --arg b3 "$HASH" \
-                   --argjson sz "${SIZE:-0}" \
-                   '.entries[$name] = {
-                     version: $ver,
-                     author: "community",
-                     trust_tier: 2,
-                     format: "wasm",
-                     url: $url,
-                     fallback_url: $fallback,
-                     blake3: $b3,
-                     size_bytes: $sz
-                   }' \
-                   "$MANIFEST" > /tmp/m.json && mv /tmp/m.json "$MANIFEST"
-              done
-            done
-          done
-
-          jq --arg ts "$TIMESTAMP" '.published_at = $ts' "$MANIFEST" > /tmp/m.json && mv /tmp/m.json "$MANIFEST"
-          jq '.signature = ""' "$MANIFEST" > /tmp/m.json && mv /tmp/m.json "$MANIFEST"
+          mkdir -p "/tmp/registry/${CHANNEL}/community"
+          cp -r artifacts/registry/. "/tmp/registry/${CHANNEL}/community/"
 
           cd /tmp/registry
           git config user.name "rove-ci"
           git config user.email "ci@roveai.co"
           git add -A
           if git diff --cached --quiet; then
-            echo "No community manifest changes."
+            echo "No changes to registry."
           else
             git commit -m "release(${CHANNEL}): community plugins (${COMMIT})"
             git push
