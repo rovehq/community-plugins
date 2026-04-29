@@ -1,6 +1,15 @@
-# Rove Community Plugins
+# Rove Community Extensions
 
 Welcome to the community extension hub for Rove!
+
+## Structure
+
+```
+community-extension/
+  plugins/    ← WASM sandboxed tools (most contributions go here)
+  native/     ← Native dylib tools (requires explicit review)
+  channels/   ← Channel integrations
+```
 
 This repository acts as a staging ground and distribution catalog for third-party WebAssembly agent tools. Rove allows you to extend the capabilities of your autonomous local AI agents completely securely via WASM compilation.
 

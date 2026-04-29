@@ -1,4 +1,4 @@
-name: Community Plugins — Build, Sign & Deploy (community-signed)
+name: Community Extensions — Build, Sign & Deploy (community-signed)
 
 on:
   push:
@@ -37,7 +37,7 @@ jobs:
           fi
 
   build:
-    name: Build & Sign Community WASM Plugins (${{ needs.resolve-channel.outputs.channel }})
+    name: Build & Sign Community Extensions (${{ needs.resolve-channel.outputs.channel }})
     needs: [resolve-channel]
     runs-on: ubuntu-latest
     steps:
@@ -54,7 +54,7 @@ jobs:
           cargo install wasm-tools 2>/dev/null || true
           sudo apt-get update -qq && sudo apt-get install -y -qq openssl 2>/dev/null || true
 
-      - name: Build, sign & bundle each community plugin
+      - name: Build, sign & bundle each community extension
         env:
           OFFICIAL_PRIV: ${{ secrets.ROVE_TEAM_OFFICIAL_PRIVATE_KEY }}
           COMMUNITY_PRIV: ${{ secrets.ROVE_TEAM_COMMUNITY_PRIVATE_KEY }}
@@ -68,16 +68,20 @@ jobs:
           export OFFICIAL_KEY_HEX="$OFFICIAL_PRIV"
           export COMMUNITY_KEY_HEX="$COMMUNITY_PRIV"
 
-          for plugin_dir in */; do
+          for plugin_dir in plugins/*/ native/*/ channels/*/; do
+            [ ! -d "$plugin_dir" ] && continue
             [ ! -f "${plugin_dir}Cargo.toml" ] && continue
             [ ! -f "${plugin_dir}manifest.json" ] && continue
             plugin_name=$(basename "$plugin_dir" | tr -d '/')
 
             echo "=== Building: $plugin_name ==="
-            (cd "$plugin_dir" && cargo build --target wasm32-wasip1 --release)
-
             wasm_name=$(echo "$plugin_name" | tr '-' '_')
-            wasm_src="${plugin_dir}target/wasm32-wasip1/release/${wasm_name}.wasm"
+            if ! cargo build -p "$plugin_name" --target wasm32-wasip1 --release 2>&1; then
+              echo "  SKIP: wasm build failed for $plugin_name (native-only?)"
+              continue
+            fi
+
+            wasm_src="target/wasm32-wasip1/release/${wasm_name}.wasm"
             [ ! -f "$wasm_src" ] && echo "  WARN: no wasm, skipping" && continue
 
             wasm-tools validate "$wasm_src" || true
@@ -100,7 +104,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
+          name: community-extensions-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
           retention-days: 1
 
@@ -118,7 +122,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
+          name: community-extensions-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
 
       - name: Prepare R2 layout
@@ -155,7 +159,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: community-plugins-${{ needs.resolve-channel.outputs.channel }}
+          name: community-extensions-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
 
       - name: Push to registry repo
@@ -175,6 +179,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "release(${CHANNEL}): community plugins (${COMMIT})"
+            git commit -m "release(${CHANNEL}): community extensions (${COMMIT})"
             git push
           fi
