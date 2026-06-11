@@ -8,12 +8,14 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   schedule:
     - cron: "0 22 * * *"
   workflow_dispatch: {}
