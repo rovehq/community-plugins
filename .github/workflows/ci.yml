@@ -8,6 +8,7 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - "**/*.json"
       - ".github/workflows/ci.yml"
   pull_request:
     branches: [main]
@@ -15,6 +16,7 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - "**/*.json"
       - ".github/workflows/ci.yml"
   schedule:
     - cron: "0 22 * * *"
