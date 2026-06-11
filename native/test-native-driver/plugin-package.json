@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "id": "test-native-driver",
+  "payload_hash": "LOCAL_DEV_PAYLOAD_HASH",
+  "payload_signature": "LOCAL_DEV_PAYLOAD_SIGNATURE",
+  "runtime_config": "runtime.json"
+}

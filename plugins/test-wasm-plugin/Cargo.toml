@@ -1,0 +1,13 @@
+[package]
+name = "test_wasm_plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Test Wasm Plugin Plugin plugin for Rove"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+extism-pdk = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

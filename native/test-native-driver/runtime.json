@@ -1,0 +1,31 @@
+{
+  "tools": [
+    {
+      "description": "Execute the main entry point for Test Native Driver",
+      "domains": [
+        "all"
+      ],
+      "name": "run",
+      "parameters": {
+        "properties": {
+          "file": {
+            "description": "Single file path",
+            "type": "string"
+          },
+          "files": {
+            "description": "Additional file paths",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "input": {
+            "description": "Primary task input",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  ]
+}

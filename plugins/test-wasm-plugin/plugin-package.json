@@ -1,0 +1,8 @@
+{
+  "artifact": "target/wasm32-wasip1/release/test_wasm_plugin.wasm",
+  "enabled": true,
+  "id": "test-wasm-plugin",
+  "payload_hash": "LOCAL_DEV_PAYLOAD_HASH",
+  "payload_signature": "LOCAL_DEV_PAYLOAD_SIGNATURE",
+  "runtime_config": "runtime.json"
+}

@@ -1,0 +1,12 @@
+[package]
+name = "test_native_driver"
+version = "0.1.0"
+edition = "2021"
+description = "Test Native Driver Plugin extension for Rove"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sdk = { path = "../../../core/sdk" }
+serde_json = "1"

@@ -39,9 +39,19 @@ jobs:
   build:
     name: Build & Sign Community Extensions (${{ needs.resolve-channel.outputs.channel }})
     needs: [resolve-channel]
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout extensions
+        uses: actions/checkout@v4
+        with:
+          path: extensions
+
+      - name: Checkout core engine
+        uses: actions/checkout@v4
+        with:
+          repository: rovehq/core
+          path: core
+          token: ${{ secrets.REGISTRY_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,10 +59,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install tools
+      - name: Build Rove CLI
         run: |
-          cargo install wasm-tools 2>/dev/null || true
-          sudo apt-get update -qq && sudo apt-get install -y -qq openssl 2>/dev/null || true
+          cd core
+          cargo build --release -p engine
+          cd ..
 
       - name: Build, sign & bundle each community extension
         env:
@@ -61,13 +72,10 @@ jobs:
         run: |
           set -e
           mkdir -p artifacts/registry
+          export ROVE_TEAM_OFFICIAL_PRIVATE_KEY="$OFFICIAL_PRIV"
+          export ROVE_TEAM_COMMUNITY_PRIVATE_KEY="$COMMUNITY_PRIV"
 
-          # Community registry JSON (index, release, catalog) signed with community key.
-          # payload_signature always uses official key (engine verifies with team_public_key).
-          # Pass official key for payload signing, community key for JSON signing via env.
-          export OFFICIAL_KEY_HEX="$OFFICIAL_PRIV"
-          export COMMUNITY_KEY_HEX="$COMMUNITY_PRIV"
-
+          cd extensions
           for plugin_dir in plugins/*/ native/*/ channels/*/; do
             [ ! -d "$plugin_dir" ] && continue
             [ ! -f "${plugin_dir}Cargo.toml" ] && continue
@@ -75,32 +83,14 @@ jobs:
             plugin_name=$(basename "$plugin_dir" | tr -d '/')
 
             echo "=== Building: $plugin_name ==="
-            wasm_name=$(echo "$plugin_name" | tr '-' '_')
-            if ! cargo build -p "$plugin_name" --target wasm32-wasip1 --release 2>&1; then
-              echo "  SKIP: wasm build failed for $plugin_name (native-only?)"
-              continue
+            if [[ "$plugin_dir" == native/* ]]; then
+              ../core/target/release/rove native publish "$plugin_dir" --registry-dir ../artifacts/registry
+            else
+              ../core/target/release/rove plugin publish "$plugin_dir" --registry-dir ../artifacts/registry
             fi
-
-            wasm_src="target/wasm32-wasip1/release/${wasm_name}.wasm"
-            [ ! -f "$wasm_src" ] && echo "  WARN: no wasm, skipping" && continue
-
-            wasm-tools validate "$wasm_src" || true
-
-            python3 scripts/ci-bundle.py \
-              --plugin-dir "$plugin_dir" \
-              --wasm-file "$wasm_src" \
-              --registry-dir artifacts/registry \
-              --official-key-hex "$OFFICIAL_PRIV" \
-              --json-sign-key-hex "$COMMUNITY_PRIV"
           done
 
-          python3 scripts/ci-bundle.py \
-            --finalize-catalog \
-            --registry-dir artifacts/registry \
-            --official-key-hex "$OFFICIAL_PRIV" \
-            --json-sign-key-hex "$COMMUNITY_PRIV"
-
-          find artifacts/ -type f | sort
+          find ../artifacts -type f | sort
 
       - uses: actions/upload-artifact@v4
         with:

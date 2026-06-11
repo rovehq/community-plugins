@@ -1,0 +1,19 @@
+{
+  "description": "Test Native Driver plugin for Rove",
+  "min_model": null,
+  "name": "Test Native Driver",
+  "permissions": {
+    "filesystem": [],
+    "host_patterns": [],
+    "memory_read": false,
+    "memory_write": false,
+    "network": [],
+    "secrets": [],
+    "tools": []
+  },
+  "plugin_type": "Plugin",
+  "sdk_version": "0.1.0",
+  "signature": "LOCAL_DEV_MANIFEST_SIGNATURE",
+  "trust_tier": "Reviewed",
+  "version": "0.1.0"
+}
