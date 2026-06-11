@@ -69,11 +69,13 @@ jobs:
         env:
           OFFICIAL_PRIV: ${{ secrets.ROVE_TEAM_OFFICIAL_PRIVATE_KEY }}
           COMMUNITY_PRIV: ${{ secrets.ROVE_TEAM_COMMUNITY_PRIVATE_KEY }}
+          ROVE_WORKSPACE: ${{ github.workspace }}/rove_workspace
+          ROVE_DATA_DIR: ${{ github.workspace }}/rove_data
+          ROVE_TEAM_PRIVATE_KEY: ${{ secrets.ROVE_TEAM_COMMUNITY_PRIVATE_KEY }}
         run: |
           set -e
+          mkdir -p "$ROVE_WORKSPACE" "$ROVE_DATA_DIR"
           mkdir -p artifacts/registry
-          export ROVE_TEAM_OFFICIAL_PRIVATE_KEY="$OFFICIAL_PRIV"
-          export ROVE_TEAM_COMMUNITY_PRIVATE_KEY="$COMMUNITY_PRIV"
 
           cd extensions
           for plugin_dir in plugins/*/ native/*/ channels/*/; do
