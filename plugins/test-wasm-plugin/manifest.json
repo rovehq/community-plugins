@@ -14,6 +14,6 @@
   "plugin_type": "Plugin",
   "sdk_version": "0.1.0",
   "signature": "LOCAL_DEV_MANIFEST_SIGNATURE",
-  "trust_tier": "Reviewed",
+  "trust_tier": "Community",
   "version": "0.1.0"
 }
