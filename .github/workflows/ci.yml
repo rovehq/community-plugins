@@ -90,9 +90,19 @@ jobs:
 
             echo "=== Building: $plugin_name ==="
             if [[ "$plugin_dir" == native/* ]]; then
-              ../core/target/release/rove native publish "$plugin_dir" --registry-dir ../artifacts/registry
+              cargo build -p "$plugin_name" --release
+              # For native, rove expects the dylib/so/dll in the root
+              find ../target/release -maxdepth 1 -name "lib${plugin_name//-/_}.dylib" -exec cp {} "$plugin_dir" \;
+              find ../target/release -maxdepth 1 -name "lib${plugin_name//-/_}.so" -exec cp {} "$plugin_dir" \;
+              find ../target/release -maxdepth 1 -name "${plugin_name//-/_}.dll" -exec cp {} "$plugin_dir" \;
+              
+              ../core/target/release/rove native publish "$plugin_dir" --registry-dir ../artifacts/registry --no-build
             else
-              ../core/target/release/rove plugin publish "$plugin_dir" --registry-dir ../artifacts/registry
+              cargo build -p "$plugin_name" --target wasm32-wasip1 --release
+              wasm_file=$(echo "$plugin_name" | tr '-' '_').wasm
+              cp "../target/wasm32-wasip1/release/$wasm_file" "$plugin_dir"
+              
+              ../core/target/release/rove plugin publish "$plugin_dir" --registry-dir ../artifacts/registry --no-build
             fi
           done
 
